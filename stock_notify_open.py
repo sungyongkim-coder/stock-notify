@@ -84,16 +84,36 @@ def fetch_today_and_prev(code: str):
     return today, prev
 
 
-def build_message(codes) -> str:
+def parse_codes(codes_raw: str):
+    """
+    STOCK_CODES 를 (코드, 이름) 리스트로 파싱.
+    형식: "005930:삼성전자,035720:카카오,000660"
+    이름을 생략하면(콜론 없음) 이름 자리에 코드를 그대로 사용.
+    """
+    result = []
+    for token in codes_raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            code, name = token.split(":", 1)
+            result.append((code.strip(), name.strip() or code.strip()))
+        else:
+            result.append((token, token))
+    return result
+
+
+def build_message(pairs) -> str:
     from datetime import datetime
 
     lines = [f"🔔 {datetime.now():%Y-%m-%d} 개장 시초가 (네이버)"]
     alerts = []
 
-    for code in codes:
+    for code, name in pairs:
         today, prev = fetch_today_and_prev(code)
+        label = f"{name}({code})" if name != code else code
         if today is None:
-            lines.append(f"\n[{code}] 데이터 없음 (조회 실패/휴장 가능)")
+            lines.append(f"\n[{label}] 데이터 없음 (조회 실패/휴장 가능)")
             continue
 
         # today = [날짜, 시가, 고가, 저가, 현재가, 거래량, ...]
@@ -101,7 +121,7 @@ def build_message(codes) -> str:
             open_price = float(today[1])
             cur_price = float(today[4])
         except (IndexError, ValueError, TypeError):
-            lines.append(f"\n[{code}] 응답 형식이 예상과 달라 파싱 실패: {today}")
+            lines.append(f"\n[{label}] 응답 형식이 예상과 달라 파싱 실패: {today}")
             continue
 
         prev_close = float(prev[4]) if prev and len(prev) > 4 else None
@@ -110,7 +130,7 @@ def build_message(codes) -> str:
         arrow = "🔺" if change_rate > 0 else ("🔻" if change_rate < 0 else "➖")
 
         entry = (
-            f"\n[{code}]\n"
+            f"\n[{label}]\n"
             f"  시초가: {int(open_price):,}원\n"
             f"  현재가: {int(cur_price):,}원\n"
             f"  전일대비: {arrow} {change_rate:+.2f}%"
@@ -118,7 +138,7 @@ def build_message(codes) -> str:
         lines.append(entry)
 
         if abs(change_rate) >= ALERT_THRESHOLD:
-            alerts.append(f"  {arrow} {code} {change_rate:+.2f}%")
+            alerts.append(f"  {arrow} {label} {change_rate:+.2f}%")
 
     if alerts:
         lines.append(f"\n⚠️ 전일 대비 {ALERT_THRESHOLD:.0f}% 이상 변동")
@@ -137,13 +157,13 @@ def main():
     token = get_env("TELEGRAM_BOT_TOKEN")
     chat_id = get_env("TELEGRAM_CHAT_ID")
     codes_raw = get_env("STOCK_CODES")
-    codes = [c.strip() for c in codes_raw.split(",") if c.strip()]
+    pairs = parse_codes(codes_raw)
 
-    if not codes:
+    if not pairs:
         print("[에러] STOCK_CODES 에 유효한 종목코드가 없습니다.", file=sys.stderr)
         sys.exit(1)
 
-    message = build_message(codes)
+    message = build_message(pairs)
     send_telegram_message(token, chat_id, message)
     print("전송 완료:\n", message)
 
