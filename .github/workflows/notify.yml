@@ -2,9 +2,13 @@ name: Stock Notify
 
 on:
   schedule:
-    # 매주 월~금, UTC 07:30 = 한국시간(KST) 16:30 (장 마감 데이터 확정 후)
+    # ── 오전 개장용 (네이버 소스, 시초가) ───────────────────────────
+    # KST 09:05 = UTC 00:05, 월~금
+    - cron: "5 0 * * 1-5"
+    # ── 오후 마감용 (KRX 공식 API, 시가/종가/5% 변동) ──────────────
+    # KST 16:30 = UTC 07:30, 월~금 (KRX 확정 데이터 지연 고려)
     - cron: "30 7 * * 1-5"
-  workflow_dispatch: {}   # 수동 실행 버튼도 활성화
+  workflow_dispatch: {}   # 수동 실행 버튼
 
 jobs:
   notify:
@@ -21,10 +25,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 실행 시각(UTC 시각)에 따라 어떤 스크립트를 돌릴지 결정한다.
+      # - 00:05 UTC(오전 개장) → 네이버 시초가 스크립트
+      # - 07:30 UTC(오후 마감) → KRX 공식 API 스크립트
+      # - 수동 실행(workflow_dispatch) → 둘 다 실행
       - name: Run notifier
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KRX_OPENAPI_KEY: ${{ secrets.KRX_OPENAPI_KEY }}
-          STOCK_CODES: "347890, 007820, 332290, 003350, 107600"   ####### 관심종목 티커 수기 입력 필요#######
-        run: python stock_notify.py
+          STOCK_CODES: "347890, 007820, 332290, 003350, 107600"   # 관심 종목 코드 (쉼표 구분)
+        run: |
+          HOUR_UTC=$(date -u +%H)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "수동 실행: 오전/오후 스크립트 모두 실행"
+            python stock_notify_open.py || true
+            python stock_notify.py
+          elif [ "$HOUR_UTC" = "00" ]; then
+            echo "오전 개장 스케줄: 네이버 시초가 스크립트 실행"
+            python stock_notify_open.py
+          else
+            echo "오후 마감 스케줄: KRX 공식 API 스크립트 실행"
+            python stock_notify.py
+          fi
