@@ -39,6 +39,7 @@ NAME_KEYS = ["ISU_ABBRV", "ISU_NM", "ISU_NAME", "종목명"]
 OPEN_KEYS = ["TDD_OPNPRC", "OPNPRC", "시가"]
 CLOSE_KEYS = ["TDD_CLSPRC", "CLSPRC", "종가"]
 VOLUME_KEYS = ["ACC_TRDVOL", "TRDVOL", "거래량"]
+VALUE_KEYS = ["ACC_TRDVAL", "TRDVAL", "거래대금"]
 
 
 def get_env(name: str) -> str:
@@ -47,6 +48,25 @@ def get_env(name: str) -> str:
         print(f"[에러] 환경변수 {name} 가 설정되지 않았습니다.", file=sys.stderr)
         sys.exit(1)
     return value
+
+
+def parse_codes(codes_raw: str):
+    """
+    STOCK_CODES 를 (코드, 사용자지정이름) 리스트로 파싱.
+    형식: "005930:삼성전자,035720:카카오,000660"
+    이름을 생략하면 None (→ KRX 응답의 종목명을 사용).
+    """
+    result = []
+    for token in codes_raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            code, name = token.split(":", 1)
+            result.append((code.strip(), name.strip() or None))
+        else:
+            result.append((token, None))
+    return result
 
 
 def pick(record: dict, candidates):
@@ -85,26 +105,29 @@ def find_record(records: list, code: str):
     return None
 
 
-def build_message(codes, date_str, kospi_records, kosdaq_records) -> str:
+def build_message(pairs, date_str, kospi_records, kosdaq_records) -> str:
     pretty_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
     header = [f"📈 {pretty_date} 관심종목 시가/종가"]
     body = []
     alerts = []
 
-    for code in codes:
+    for code, user_name in pairs:
         rec = find_record(kospi_records, code)
         market = "KOSPI"
         if rec is None:
             rec = find_record(kosdaq_records, code)
             market = "KOSDAQ"
         if rec is None:
-            body.append(f"\n[{code}] 데이터 없음 (휴장일이거나 종목코드 확인 필요)")
+            label = f"{user_name}({code})" if user_name else code
+            body.append(f"\n[{label}] 데이터 없음 (휴장일이거나 종목코드 확인 필요)")
             continue
 
-        name = pick(rec, NAME_KEYS) or code
+        # 사용자가 이름을 지정했으면 그걸 우선, 없으면 KRX 응답의 종목명 사용
+        name = user_name or pick(rec, NAME_KEYS) or code
         open_price = pick(rec, OPEN_KEYS)
         close_price = pick(rec, CLOSE_KEYS)
         volume = pick(rec, VOLUME_KEYS)
+        value = pick(rec, VALUE_KEYS)
 
         if open_price is None or close_price is None:
             body.append(
@@ -125,6 +148,10 @@ def build_message(codes, date_str, kospi_records, kosdaq_records) -> str:
         )
         if volume is not None:
             entry += f"\n  거래량: {int(float(volume)):,}주"
+        if value is not None:
+            # 거래대금은 억 단위로 환산해 보기 쉽게 표시
+            eok = float(value) / 1_0000_0000
+            entry += f"\n  거래대금: {eok:,.1f}억원"
         body.append(entry)
 
         if abs(change_rate) >= ALERT_THRESHOLD:
@@ -149,9 +176,9 @@ def main():
     chat_id = get_env("TELEGRAM_CHAT_ID")
     api_key = get_env("KRX_OPENAPI_KEY")
     codes_raw = get_env("STOCK_CODES")
-    codes = [c.strip() for c in codes_raw.split(",") if c.strip()]
+    pairs = parse_codes(codes_raw)
 
-    if not codes:
+    if not pairs:
         print("[에러] STOCK_CODES 에 유효한 종목코드가 없습니다.", file=sys.stderr)
         sys.exit(1)
 
@@ -178,7 +205,7 @@ def main():
         print("[에러] 최근 5일 내 거래 데이터를 찾지 못했습니다.", file=sys.stderr)
         sys.exit(1)
 
-    message = build_message(codes, date_str, kospi_records, kosdaq_records)
+    message = build_message(pairs, date_str, kospi_records, kosdaq_records)
     send_telegram_message(token, chat_id, message)
     print("전송 완료:\n", message)
 
