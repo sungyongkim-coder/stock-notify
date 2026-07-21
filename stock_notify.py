@@ -1,5 +1,5 @@
 """
-코스피/코스닥 관심 종목의 당일 시가·종가를 텔레그램으로 알림.
+코스피/코스닥 관심 종목의 당일 시가·종가 및 5% 이상 변동 여부를 텔레그램으로 알림.
 
 필요한 환경변수:
   - TELEGRAM_BOT_TOKEN : 텔레그램 봇 토큰
@@ -7,18 +7,38 @@
   - KRX_OPENAPI_KEY    : KRX 공식 Open API 인증키 (openapi.krx.co.kr 에서 발급)
   - STOCK_CODES        : 쉼표로 구분된 6자리 종목코드 (예: "005930,035720,000660")
 
-사용 라이브러리: pykrx-openapi (KRX 공식 Open API 래퍼, API 키 인증), requests
+동작:
+  장 마감 후 그날 확정된 일별매매정보를 받아
+  1) 시초가, 2) 종가, 3) 시가 대비 등락률을 정리하고,
+  등락률이 ±5% 이상이면 별도 강조하여 알림을 보낸다.
 
-참고: get_stock_daily_trade / get_kosdaq_stock_daily_trade 는
-{"OutBlock_1": [ {필드명: 값, ...}, ... ]} 형태의 dict를 반환한다.
+주의:
+  이 KRX Open API는 '장중 실시간' 시세를 제공하지 않으므로,
+  '장중 5% 변동 즉시 알림'은 불가능하다. 여기서의 5% 판정은
+  '그날 시가 대비 종가 변동'을 장 마감 후에 계산한 것이다.
+
+라이브러리 응답 형태: {"OutBlock_1": [ {필드명: 값, ...}, ... ]}
 """
 
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 
 import requests
 from pykrx_openapi import KRXOpenAPI, KRXAuthenticationError, KRXNetworkError
+
+# 요청 타임아웃(초)과 재시도 횟수
+REQUEST_TIMEOUT = 120
+MAX_RETRIES = 2
+# 5% 이상 변동을 '주목' 대상으로 표시
+ALERT_THRESHOLD = 5.0
+
+CODE_KEYS = ["ISU_SRT_CD", "ISU_CD", "SHORT_CD", "단축코드", "종목코드"]
+NAME_KEYS = ["ISU_ABBRV", "ISU_NM", "ISU_NAME", "종목명"]
+OPEN_KEYS = ["TDD_OPNPRC", "OPNPRC", "시가"]
+CLOSE_KEYS = ["TDD_CLSPRC", "CLSPRC", "종가"]
+VOLUME_KEYS = ["ACC_TRDVOL", "TRDVOL", "거래량"]
 
 
 def get_env(name: str) -> str:
@@ -29,16 +49,6 @@ def get_env(name: str) -> str:
     return value
 
 
-# 응답 레코드(dict)에서 값을 꺼낼 때 사용할 후보 필드명들.
-# KRX 필드명은 대체로 대문자 스네이크. 버전/엔드포인트에 따라 조금씩 달라질 수
-# 있어 여러 후보를 순서대로 확인한다.
-CODE_KEYS = ["ISU_SRT_CD", "ISU_CD", "SHORT_CD", "단축코드", "종목코드"]
-NAME_KEYS = ["ISU_ABBRV", "ISU_NM", "ISU_NAME", "종목명"]
-OPEN_KEYS = ["TDD_OPNPRC", "OPNPRC", "시가"]
-CLOSE_KEYS = ["TDD_CLSPRC", "CLSPRC", "종가"]
-VOLUME_KEYS = ["ACC_TRDVOL", "TRDVOL", "거래량"]
-
-
 def pick(record: dict, candidates):
     for key in candidates:
         if key in record and record[key] not in (None, ""):
@@ -47,12 +57,24 @@ def pick(record: dict, candidates):
 
 
 def get_records(resp) -> list:
-    """라이브러리 응답(dict)에서 레코드 리스트를 안전하게 추출."""
     if isinstance(resp, dict):
         return resp.get("OutBlock_1", []) or []
     if isinstance(resp, list):
         return resp
     return []
+
+
+def call_with_retry(func, bas_dd):
+    """타임아웃/네트워크 오류에 대비해 몇 번 재시도한다."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return func(bas_dd=bas_dd)
+        except KRXNetworkError as e:
+            print(f"[경고] {bas_dd} 조회 {attempt}/{MAX_RETRIES} 실패: {e}",
+                  file=sys.stderr)
+            if attempt < MAX_RETRIES:
+                time.sleep(3)
+    return None
 
 
 def find_record(records: list, code: str):
@@ -63,25 +85,20 @@ def find_record(records: list, code: str):
     return None
 
 
-def fetch_record_for_code(client, code, kospi_records, kosdaq_records):
-    """미리 받아둔 코스피/코스닥 레코드에서 종목을 찾는다."""
-    rec = find_record(kospi_records, code)
-    if rec is not None:
-        return rec, "KOSPI"
-    rec = find_record(kosdaq_records, code)
-    if rec is not None:
-        return rec, "KOSDAQ"
-    return None, None
-
-
 def build_message(codes, date_str, kospi_records, kosdaq_records) -> str:
     pretty_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-    lines = [f"📈 {pretty_date} 관심종목 시가/종가"]
+    header = [f"📈 {pretty_date} 관심종목 시가/종가"]
+    body = []
+    alerts = []
 
     for code in codes:
-        rec, market = fetch_record_for_code(None, code, kospi_records, kosdaq_records)
+        rec = find_record(kospi_records, code)
+        market = "KOSPI"
         if rec is None:
-            lines.append(f"\n[{code}] 데이터 없음 (휴장일이거나 종목코드 확인 필요)")
+            rec = find_record(kosdaq_records, code)
+            market = "KOSDAQ"
+        if rec is None:
+            body.append(f"\n[{code}] 데이터 없음 (휴장일이거나 종목코드 확인 필요)")
             continue
 
         name = pick(rec, NAME_KEYS) or code
@@ -90,7 +107,7 @@ def build_message(codes, date_str, kospi_records, kosdaq_records) -> str:
         volume = pick(rec, VOLUME_KEYS)
 
         if open_price is None or close_price is None:
-            lines.append(
+            body.append(
                 f"\n[{name}({code})] 시가/종가 필드를 찾지 못했습니다.\n"
                 f"  (원본 필드: {list(rec.keys())})"
             )
@@ -102,20 +119,28 @@ def build_message(codes, date_str, kospi_records, kosdaq_records) -> str:
 
         entry = (
             f"\n[{name}({code}) · {market}]\n"
-            f"  시가: {int(open_price):,}원\n"
+            f"  시초가: {int(open_price):,}원\n"
             f"  종가: {int(close_price):,}원\n"
             f"  등락: {arrow} {change_rate:+.2f}%"
         )
         if volume is not None:
             entry += f"\n  거래량: {int(float(volume)):,}주"
-        lines.append(entry)
+        body.append(entry)
+
+        if abs(change_rate) >= ALERT_THRESHOLD:
+            alerts.append(f"  {arrow} {name}({code}) {change_rate:+.2f}%")
+
+    lines = header + body
+    if alerts:
+        lines.append(f"\n⚠️ 시가 대비 {ALERT_THRESHOLD:.0f}% 이상 변동")
+        lines.extend(alerts)
 
     return "\n".join(lines)
 
 
 def send_telegram_message(token, chat_id, text) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=10)
+    resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=30)
     resp.raise_for_status()
 
 
@@ -131,7 +156,7 @@ def main():
         sys.exit(1)
 
     try:
-        client = KRXOpenAPI(api_key=api_key)
+        client = KRXOpenAPI(api_key=api_key, timeout=REQUEST_TIMEOUT)
     except KRXAuthenticationError:
         print("[에러] KRX_OPENAPI_KEY 가 유효하지 않습니다.", file=sys.stderr)
         sys.exit(1)
@@ -141,21 +166,12 @@ def main():
     kospi_records, kosdaq_records = [], []
     for i in range(5):
         candidate = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
-        try:
-            kospi_resp = client.get_stock_daily_trade(bas_dd=candidate)
-        except KRXNetworkError as e:
-            print(f"[경고] {candidate} 코스피 조회 네트워크 오류: {e}", file=sys.stderr)
-            continue
-
+        kospi_resp = call_with_retry(client.get_stock_daily_trade, candidate)
         kospi_records = get_records(kospi_resp)
         if kospi_records:
             date_str = candidate
-            try:
-                kosdaq_resp = client.get_kosdaq_stock_daily_trade(bas_dd=candidate)
-                kosdaq_records = get_records(kosdaq_resp)
-            except Exception as e:
-                print(f"[경고] 코스닥 조회 실패(코스피만 사용): {e}", file=sys.stderr)
-                kosdaq_records = []
+            kosdaq_resp = call_with_retry(client.get_kosdaq_stock_daily_trade, candidate)
+            kosdaq_records = get_records(kosdaq_resp)
             break
 
     if date_str is None:
