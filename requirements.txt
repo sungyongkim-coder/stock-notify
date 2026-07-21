@@ -1,2 +1,2 @@
-pykrx
+pykrx-openapi
 requests
