@@ -34,7 +34,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KRX_OPENAPI_KEY: ${{ secrets.KRX_OPENAPI_KEY }}
-          STOCK_CODES: "347890, 007820, 332290, 003350, 107600"   # 관심 종목 코드 (쉼표 구분)
+          STOCK_CODES: "347890:엠엑스온, 007820:엠엑스로보틱스, 332290:누보, 003350:한국화장품제조, 107600:새빗켐"   # 관심 종목 코드 (쉼표 구분)
         run: |
           HOUR_UTC=$(date -u +%H)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
