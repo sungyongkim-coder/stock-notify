@@ -3,11 +3,13 @@ name: Stock Notify
 on:
   schedule:
     # ── 오전 개장용 (네이버 소스, 시초가) ───────────────────────────
-    # KST 09:05 = UTC 00:05, 월~금
-    - cron: "5 0 * * 1-5"
-    # ── 오후 마감용 (KRX 공식 API, 시가/종가/5% 변동) ──────────────
-    # KST 16:30 = UTC 07:30, 월~금 (KRX 확정 데이터 지연 고려)
-    - cron: "30 7 * * 1-5"
+    # 목표 KST 09:00. 혼잡한 정각(UTC 00:00)을 피해 UTC 23:47(전일)로 예약.
+    # UTC 23:47 + 9h = KST 08:47. 요일 0-4(일~목)는 KST로 월~금이 됨.
+    # 조금 밀려도 오전 중 도착하도록 목표보다 앞당겨 잡음.
+    - cron: "47 23 * * 0-4"
+    # ── 오후 마감용 (KRX 공식 API, 시가/종가/거래대금/5% 변동) ──────
+    # 목표 KST 16:30. UTC 07:33(=KST 16:33)로, 붐비는 30/00분에서 살짝 비켜서.
+    - cron: "33 7 * * 1-5"
   workflow_dispatch: {}   # 수동 실행 버튼
 
 jobs:
@@ -25,26 +27,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 실행 시각(UTC 시각)에 따라 어떤 스크립트를 돌릴지 결정한다.
-      # - 00:05 UTC(오전 개장) → 네이버 시초가 스크립트
-      # - 07:30 UTC(오후 마감) → KRX 공식 API 스크립트
+      # 실행 시점의 '한국시간(KST) 시각'으로 오전/오후를 판단한다.
+      # UTC 시(hour)로 판단하면 실행이 몇 시간 밀렸을 때 오전 작업이 오후로
+      # 오인될 수 있으므로, KST 기준 12시 이전이면 오전(네이버 시초가),
+      # 이후면 오후(KRX 마감)로 처리한다.
       # - 수동 실행(workflow_dispatch) → 둘 다 실행
       - name: Run notifier
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KRX_OPENAPI_KEY: ${{ secrets.KRX_OPENAPI_KEY }}
-          STOCK_CODES: "347890:엠엑스온, 007820:엠엑스로보틱스, 332290:누보, 003350:한국화장품제조, 107600:새빗켐"   # 관심 종목 코드 (쉼표 구분)
+          STOCK_CODES: "347890:엠엑스온, 007820:엠엑스로보틱스, 003350:한국화장품제조, 107600:새빗켐"   # 코드:이름 (이름 생략 가능)
         run: |
-          HOUR_UTC=$(date -u +%H)
+          HOUR_KST=$(TZ=Asia/Seoul date +%H)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "수동 실행: 오전/오후 스크립트 모두 실행"
             python stock_notify_open.py || true
             python stock_notify.py
-          elif [ "$HOUR_UTC" = "00" ]; then
-            echo "오전 개장 스케줄: 네이버 시초가 스크립트 실행"
+          elif [ "$HOUR_KST" -lt 12 ]; then
+            echo "오전(KST ${HOUR_KST}시): 네이버 시초가 스크립트 실행"
             python stock_notify_open.py
           else
-            echo "오후 마감 스케줄: KRX 공식 API 스크립트 실행"
+            echo "오후(KST ${HOUR_KST}시): KRX 공식 API 스크립트 실행"
             python stock_notify.py
           fi
