@@ -236,7 +236,7 @@ class LiveTranscriber(threading.Thread):
                 last_end = None
                 with open(self.part, "a", encoding="utf-8") as f:
                     for s in segments:
-                        text = s.text.strip()
+                        text = squash_repeats(s.text.strip())
                         if text:
                             last_end = self.done + s.end
                             f.write(f"{last_end:.2f}\t{text}\n")
@@ -365,7 +365,7 @@ def transcribe(wav_path):
 
     with open(part_path, "a", encoding="utf-8") as f:
         for s in segments:
-            text = s.text.strip()
+            text = squash_repeats(s.text.strip())
             if not text:
                 continue
             lines.append(text)
@@ -379,6 +379,11 @@ def transcribe(wav_path):
         f.write(out + "\n")
     os.remove(part_path)
     return out
+
+
+def squash_repeats(text):
+    """Whisper가 같은 말을 수십 번 되풀이하는 환각("없을 수 없을 수 …")을 한 번으로 줄인다."""
+    return re.sub(r"(\S.{1,19}?)(?:\s*\1){3,}", r"\1", text)
 
 
 def summarize(transcript):
@@ -397,6 +402,9 @@ def summarize(transcript):
     except subprocess.TimeoutExpired:
         return "(요약 실패: 15분 안에 응답이 없었습니다. 아래 전문을 참고하세요.)"
     out = r.stdout.strip()
+    if "Not logged in" in out + r.stderr or "/login" in out + r.stderr:
+        return ("(요약 실패: Claude Code에 로그인되어 있지 않습니다. 명령 프롬프트에서 claude 를 실행하고 "
+                "/login 으로 Pro 계정에 로그인한 뒤 다시 돌리세요. 아래 전문을 참고하세요.)")
     if r.returncode != 0 or not out:
         # CLI는 사용량 초과 같은 오류를 stdout에 찍기도 하므로 둘 다 본다.
         why = (r.stderr.strip() or out)[:500] or f"빈 응답, 종료 코드 {r.returncode}"
@@ -468,7 +476,17 @@ def report(wav_path):
         print(f"  워드 변환 실패: {e}")
         out = md_path
     print(f"✓ 문서 생성: {out}")
+    if summary.startswith("(요약 실패"):
+        print(f"  요약만 다시 하려면(전사는 저장돼 있어 바로 끝남):\n  python meeting.py \"{wav_path}\"")
     return out
+
+
+def deliver(out):
+    """결과 문서를 바탕화면으로 옮기고 연다."""
+    final = os.path.join(desktop(), os.path.basename(out))
+    shutil.move(out, final)
+    print(f"✓ 바탕화면: {os.path.basename(final)}")
+    os.startfile(final)
 
 
 def main():
@@ -518,11 +536,8 @@ def main():
     write_wav(wav_path, audio)
     print(f"■ 녹음 종료 ({dur}).")
 
-    out = report(wav_path)
-    final = os.path.join(desktop(), os.path.basename(out))
-    shutil.move(out, final)
-    print(f"✓ 바탕화면: {os.path.basename(final)}   (원본 녹음: {work})")
-    os.startfile(final)
+    deliver(report(wav_path))
+    print(f"  (원본 녹음: {work})")
 
 
 def selftest():
@@ -546,6 +561,9 @@ def selftest():
 
     assert by_speaker([(1, "안녕"), (1, "하세요"), (2, "네"), (1, " "), (1, "시작")]) == \
         "화자1: 안녕 하세요\n화자2: 네\n화자1: 시작"
+
+    assert squash_repeats("기업을 했으면 없을 수 없을 수 없을 수 없을 수 없을 수 없") == "기업을 했으면 없을 수 없"
+    assert squash_repeats("네 네 그렇죠. 하하하하") == "네 네 그렇죠. 하하하하"   # 짧은 반복은 그대로
 
     t = Track(None, "가짜")
     t.frames = [np.arange(i * 4, i * 4 + 4, dtype="float32") for i in range(5)]
@@ -594,6 +612,6 @@ if __name__ == "__main__":
         selftest()
     elif wavs:
         for p in wavs:
-            report(p)
+            deliver(report(p))
     else:
         main()
