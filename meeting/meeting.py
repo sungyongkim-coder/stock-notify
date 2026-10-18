@@ -3,6 +3,7 @@
 사용법: python meeting.py            (Enter 치면 녹음 종료 후 자동 처리)
         python meeting.py a.wav b.wav (이미 있는 녹음 파일로 회의록만 뽑기)
 
+녹음하는 동안 CHUNK초씩 미리 전사해 두므로, 회의가 끝나면 마지막 몇십 초만 전사하면 된다.
 전사는 세그먼트마다 .txt.part에 적어두므로 중간에 끊겨도 다시 돌리면 이어서 한다.
 """
 
@@ -25,12 +26,17 @@ warnings.filterwarnings("ignore", message="data discontinuity in recording")
 
 SR = 48000
 BLOCK = SR // 10
-# ponytail: 정확도/속도 조절 손잡이. 속도 우선이면 base, 정확도 아쉬우면 small/medium, GPU면 large-v3.
+# ponytail: 정확도/속도 조절 손잡이. 비우면 GPU는 large-v3-turbo, CPU는 small.
+#           base는 한국어가 거의 알아볼 수 없는 수준이라 기본값에서 뺐다.
+#           녹음 중에 미리 전사하므로 CPU가 괜찮으면 medium도 회의 길이 안에 따라잡는다.
 #           바꾼 뒤 다시 뽑으려면 기존 .txt 전사본을 지워야 캐시를 안 쓴다.
 #           base/small/medium은 로컬 캐시에 있다. 그 외 모델은 첫 실행에 인터넷이 필요하다.
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "")
+# WHISPER_DEVICE=cpu 로 GPU 자동 사용을 끌 수 있다.
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
+CHUNK = 30          # 녹음 중 이만큼(초) 쌓일 때마다 미리 전사
 
-# ponytail: 한 줄 유지. 여러 줄이면 CLI에 형식 지시가 안 붙는다.
+# 프롬프트는 stdin으로 넘기므로 여러 줄이어도 된다(명령줄 인자는 cmd.exe가 망가뜨릴 수 있다).
 PROMPT = (
     "입력된 업무 회의 녹취록을 한국어 회의록으로 정리하세요. "
     "반드시 이 5개 제목을 순서대로 그대로 사용하세요: "
@@ -80,8 +86,25 @@ class Track(threading.Thread):
     def mono(self):
         if not self.frames:
             return np.zeros(0, "float32")
-        a = np.concatenate(self.frames)
-        return (a.mean(axis=1) if a.ndim > 1 else a).astype("float32")
+        return to_mono(np.concatenate(self.frames))
+
+    def length(self):
+        return sum(len(f) for f in list(self.frames))
+
+    def segment(self, start, end):
+        """[start, end) 샘플 구간의 모노 신호. 녹음 중에도 부를 수 있다."""
+        out, pos = [], 0
+        for f in list(self.frames):
+            if pos >= end:
+                break
+            if pos + len(f) > start:
+                out.append(f[max(0, start - pos):end - pos])
+            pos += len(f)
+        return to_mono(np.concatenate(out)) if out else np.zeros(0, "float32")
+
+
+def to_mono(a):
+    return (a.mean(axis=1) if a.ndim > 1 else a).astype("float32")
 
 
 def open_tracks():
@@ -120,9 +143,108 @@ def resume_from(part_path):
     return lines, offset
 
 
+_model = None
+
+
+def load_model():
+    """Whisper 모델을 한 번만 올린다. CUDA GPU가 쓸 수 있으면 GPU, 아니면 CPU."""
+    global _model
+    if _model is not None:
+        return _model
+    from faster_whisper import WhisperModel
+
+    if WHISPER_DEVICE != "cpu":
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                m = WhisperModel(WHISPER_MODEL or "large-v3-turbo", device="cuda",
+                                 compute_type="float16")
+                list(m.transcribe(np.zeros(16000, "float32"))[0])  # cuDNN 등 누락을 여기서 확인
+                print(f"  전사: GPU, {WHISPER_MODEL or 'large-v3-turbo'}")
+                _model = m
+                return _model
+        except Exception as e:
+            print(f"  GPU 사용 불가, CPU로 전사합니다: {e}")
+
+    # 논리코어 전부보다 물리코어 수(대략 절반)가 더 빠르고, 녹음 중 화상회의도 덜 버벅인다.
+    _model = WhisperModel(WHISPER_MODEL or "small", device="cpu", compute_type="int8",
+                          cpu_threads=max(1, (os.cpu_count() or 4) // 2))
+    print(f"  전사: CPU, {WHISPER_MODEL or 'small'}")
+    return _model
+
+
+# beam_size=1(그리디)이 빔서치보다 몇 배 빠르다. 정확도는 조금 손해.
+OPTS = dict(language="ko", vad_filter=True, beam_size=1, condition_on_previous_text=False)
+
+
+def quiet_cut(x, search=5.0, win=0.1):
+    """x 끝쪽 search초 안에서 가장 조용한 지점. 말 중간에서 자르지 않으려고."""
+    w = int(SR * win)
+    tail = x[-int(SR * search):]
+    n = len(tail) // w
+    if n == 0:
+        return len(x)
+    energy = (tail[:n * w].reshape(n, w) ** 2).mean(axis=1)
+    return len(x) - len(tail) + int(energy.argmin()) * w + w // 2
+
+
+def next_start(start, cut_end, last_end):
+    """다음 덩어리 시작(초). 마지막 문장 끝부터 다시 보되, 되돌아가는 건 최대 3초."""
+    return max(last_end or start, cut_end - 3.0)
+
+
+class LiveTranscriber(threading.Thread):
+    """녹음하는 동안 CHUNK초씩 미리 전사해 .txt.part에 적는다.
+    녹음이 끝나면 transcribe()가 .part의 마지막 지점부터 남은 부분만 이어서 한다."""
+
+    def __init__(self, tracks, wav_path):
+        super().__init__(daemon=True)
+        self.tracks = tracks
+        self.part = os.path.splitext(wav_path)[0] + ".txt.part"
+        self.scratch = os.path.splitext(wav_path)[0] + ".live.wav"
+        self.done = 0.0
+        self.stopping = threading.Event()
+
+    def available(self):
+        lens = [t.length() for t in self.tracks]
+        # 한 장치가 멈춰 있으면(예: 아무 소리도 안 나는 스피커 루프백) 기다리지 않는다.
+        return max(lens) if max(lens) - min(lens) > 10 * SR else min(lens)
+
+    def run(self):
+        from faster_whisper.audio import decode_audio
+        try:
+            model = load_model()
+            while not self.stopping.is_set():
+                start = int(self.done * SR)
+                if self.available() - start < CHUNK * SR:
+                    self.stopping.wait(1)
+                    continue
+                x = mix(*(t.segment(start, start + CHUNK * SR) for t in self.tracks))
+                x = x[:quiet_cut(x)]
+                write_wav(self.scratch, x)
+                segments, _ = model.transcribe(decode_audio(self.scratch), **OPTS)
+                last_end = None
+                with open(self.part, "a", encoding="utf-8") as f:
+                    for s in segments:
+                        text = s.text.strip()
+                        if text:
+                            last_end = self.done + s.end
+                            f.write(f"{last_end:.2f}\t{text}\n")
+                            f.flush()
+                self.done = next_start(self.done, self.done + len(x) / SR, last_end)
+                lag = self.available() / SR - self.done
+                print(f"\r  (미리 전사 {self.done / 60:.0f}분째, 밀린 분량 {lag:.0f}초)   ",
+                      end="", flush=True)
+        except Exception as e:
+            print(f"\n  녹음 중 전사 중단(녹음은 계속됩니다): {e}")
+        finally:
+            if os.path.exists(self.scratch):
+                os.remove(self.scratch)
+
+
 def transcribe(wav_path):
     """전사. 완성본은 .txt로 캐시하고, 진행 중에는 .txt.part에 한 줄씩 적는다."""
-    from faster_whisper import WhisperModel
+    from faster_whisper import BatchedInferencePipeline
     from faster_whisper.audio import decode_audio
 
     txt_path = os.path.splitext(wav_path)[0] + ".txt"
@@ -136,11 +258,9 @@ def transcribe(wav_path):
         print(f"  이어서 전사: {offset / 60:.0f}분 지점부터")
 
     audio = decode_audio(wav_path)[int(offset * 16000):]   # decode_audio는 16kHz 모노
-    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8",
-                         cpu_threads=os.cpu_count() or 4)
-    # beam_size=1(그리디)이 빔서치보다 몇 배 빠르다. 정확도는 조금 손해.
-    segments, _ = model.transcribe(audio, language="ko", vad_filter=True,
-                                   beam_size=1, condition_on_previous_text=False)
+    # 말소리 구간들을 묶어서 한꺼번에 돌린다. GPU에서 특히 몇 배 빠르다.
+    segments, _ = BatchedInferencePipeline(model=load_model()).transcribe(
+        audio, batch_size=8, **OPTS)
 
     with open(part_path, "a", encoding="utf-8") as f:
         for s in segments:
@@ -167,13 +287,20 @@ def summarize(transcript):
     exe = shutil.which("claude.cmd") or shutil.which("claude")
     if not exe:
         return "(claude CLI를 찾을 수 없어 요약을 건너뜁니다. 아래 전문을 참고하세요.)"
-    r = subprocess.run(
-        [exe, "-p", PROMPT, "--permission-mode", "bypassPermissions"], input=transcript, capture_output=True,
-        text=True, encoding="utf-8", errors="replace", timeout=900,
-    )
-    if r.returncode != 0 or not r.stdout.strip():
-        return f"(요약 실패: {r.stderr.strip()[:500] or '빈 응답'}. 아래 전문을 참고하세요.)"
-    return r.stdout.strip()
+    # 요약에는 도구가 필요 없으므로 권한 우회(bypassPermissions)는 쓰지 않는다.
+    try:
+        r = subprocess.run(
+            [exe, "-p"], input=f"{PROMPT}\n\n<녹취록>\n{transcript}\n</녹취록>\n",
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        return "(요약 실패: 15분 안에 응답이 없었습니다. 아래 전문을 참고하세요.)"
+    out = r.stdout.strip()
+    if r.returncode != 0 or not out:
+        # CLI는 사용량 초과 같은 오류를 stdout에 찍기도 하므로 둘 다 본다.
+        why = (r.stderr.strip() or out)[:500] or f"빈 응답, 종료 코드 {r.returncode}"
+        return f"(요약 실패: {why}. 아래 전문을 참고하세요.)"
+    return out
 
 
 def to_docx(md_path):
@@ -220,7 +347,7 @@ def report(wav_path):
     except ValueError:                  # 이름이 다르면 파일 수정시각을 회의 시각으로
         stamp = datetime.datetime.fromtimestamp(os.path.getmtime(wav_path))
 
-    print(f"\n[{base}] {dur}. 전사 중… (회의 길이만큼 걸립니다)")
+    print(f"\n[{base}] {dur}. 전사 중…")
     transcript = transcribe(wav_path)
     if not transcript:
         sys.exit(f"전사 결과가 비었습니다. 녹음 파일: {wav_path}")
@@ -259,6 +386,13 @@ def main():
     if not live:
         sys.exit("녹음 장치를 하나도 못 열었습니다.")
 
+    # 바탕화면에는 결과 문서 하나만 남긴다. wav/txt/md 중간 파일은 임시 폴더에.
+    work = os.path.join(tempfile.gettempdir(), "회의록")
+    os.makedirs(work, exist_ok=True)
+    wav_path = os.path.join(work, stamp.strftime("회의록_%Y-%m-%d_%H%M") + ".wav")
+    transcriber = LiveTranscriber(live, wav_path)
+    transcriber.start()
+
     print(f"\n● 녹음 중 [{', '.join(t.label for t in live)}]. 회의 끝나면 Enter.")
     try:
         input()
@@ -268,17 +402,15 @@ def main():
         t.stopping.set()
     for t in live:
         t.join(timeout=3)
+    transcriber.stopping.set()
+    print("\n  진행 중인 전사 덩어리 마무리…")
+    transcriber.join()
 
     audio = mix(*(t.mono() for t in live))
     secs = len(audio) / SR
     if secs < 3:
         sys.exit("녹음된 소리가 없습니다.")
     dur = f"{secs:.0f}초" if secs < 60 else f"{secs / 60:.0f}분"
-
-    # 바탕화면에는 결과 문서 하나만 남긴다. wav/txt/md 중간 파일은 임시 폴더에.
-    work = os.path.join(tempfile.gettempdir(), "회의록")
-    os.makedirs(work, exist_ok=True)
-    wav_path = os.path.join(work, stamp.strftime("회의록_%Y-%m-%d_%H%M") + ".wav")
     write_wav(wav_path, audio)
     print(f"■ 녹음 종료 ({dur}).")
 
@@ -300,6 +432,19 @@ def selftest():
     q = np.array([0.5, -0.5], "float32")
     assert np.allclose(mix(q), q)           # 피크 <= 1 이면 그대로
     assert os.path.isdir(desktop()), desktop()
+
+    x = np.ones(SR * 10, "float32")
+    x[SR * 7:SR * 7 + SR // 10] = 0                       # 7초 지점만 조용함
+    assert abs(quiet_cut(x) / SR - 7.05) < 0.01, quiet_cut(x) / SR
+    assert next_start(0.0, 28.0, None) == 25.0            # 말 없으면 3초만 겹쳐 다음으로
+    assert next_start(0.0, 28.0, 27.5) == 27.5            # 마지막 문장 끝부터
+    assert next_start(30.0, 58.0, 41.0) == 55.0           # 3초 넘게 되돌아가지 않음
+
+    t = Track(None, "가짜")
+    t.frames = [np.arange(i * 4, i * 4 + 4, dtype="float32") for i in range(5)]
+    assert t.length() == 20
+    assert t.segment(6, 13).tolist() == list(range(6, 13)), t.segment(6, 13)
+    assert t.segment(18, 40).tolist() == [18, 19]
 
     part = os.path.join(os.environ["TEMP"], "_mt.txt.part")
     assert resume_from(part + ".nope") == ([], 0.0)          # 파일 없으면 처음부터
