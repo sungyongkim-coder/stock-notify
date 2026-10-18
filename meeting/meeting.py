@@ -8,6 +8,7 @@
 """
 
 import datetime
+import json
 import os
 import re
 import shutil
@@ -36,6 +37,14 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 CHUNK = 30          # 녹음 중 이만큼(초) 쌓일 때마다 미리 전사
 
+# 전사 엔진. local(기본, 무료·오프라인) / rtzr(리턴제로) / clova(네이버 CLOVA Speech).
+# API는 1시간 녹음을 몇 분 안에, 화자 구분까지 해서 돌려준다. 실패하면 local로 넘어간다.
+#   rtzr : RTZR_CLIENT_ID, RTZR_CLIENT_SECRET  (developers.rtzr.ai 콘솔에서 발급)
+#   clova: CLOVA_INVOKE_URL, CLOVA_SECRET      (네이버 클라우드 CLOVA Speech 도메인의 Invoke URL / Secret Key)
+STT = os.getenv("STT", "local").lower()
+# 고유명사 인식률을 올릴 단어들, 쉼표로 구분. 예) set STT_KEYWORDS=H마트,한인마트,미국법인
+STT_KEYWORDS = [k.strip() for k in os.getenv("STT_KEYWORDS", "").split(",") if k.strip()]
+
 # 프롬프트는 stdin으로 넘기므로 여러 줄이어도 된다(명령줄 인자는 cmd.exe가 망가뜨릴 수 있다).
 PROMPT = (
     "입력된 업무 회의 녹취록을 한국어 회의록으로 정리하세요. "
@@ -43,6 +52,7 @@ PROMPT = (
     "'## 한 줄 요약', '## 핵심 논의', '## 결정사항', '## 액션 아이템', '## 후속 확인 필요'. "
     "액션 아이템은 '담당자 / 할 일 / 기한' 형태로 쓰고 언급이 없으면 '미지정'이라고 적으세요. "
     "녹취에 없는 내용은 지어내지 말고, 알아듣기 어려운 부분은 '(불명확)'으로 표시하세요. "
+    "줄이 '화자N:'으로 시작하면 자동 화자 구분 결과이니 누가 한 말인지 구분하는 데 참고하세요. "
     "서두나 맺음말 없이 회의록 본문만 출력하세요."
 )
 
@@ -122,11 +132,11 @@ def open_tracks():
     return tracks
 
 
-def write_wav(path, mono):
+def write_wav(path, mono, sr=SR):
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
-        w.setframerate(SR)
+        w.setframerate(sr)
         w.writeframes((np.clip(mono, -1, 1) * 32767).astype("<i2").tobytes())
 
 
@@ -242,6 +252,81 @@ class LiveTranscriber(threading.Thread):
                 os.remove(self.scratch)
 
 
+def by_speaker(utterances):
+    """[(화자, 말)] -> '화자N: ...' 줄들. 같은 사람이 이어서 한 말은 한 줄로 합친다."""
+    lines, prev = [], None
+    for spk, text in utterances:
+        text = text.strip()
+        if not text:
+            continue
+        if spk == prev:
+            lines[-1] += " " + text
+        else:
+            lines.append(f"화자{spk}: {text}")
+            prev = spk
+    return "\n".join(lines)
+
+
+def upload_copy(wav_path):
+    """업로드용 16kHz 모노 wav(48kHz 원본의 1/3 크기). 반환값은 임시 파일 경로."""
+    from faster_whisper.audio import decode_audio
+    path = os.path.splitext(wav_path)[0] + ".16k.wav"
+    write_wav(path, decode_audio(wav_path), sr=16000)
+    return path
+
+
+def transcribe_rtzr(path):
+    import requests
+    api = "https://openapi.vito.ai/v1"
+    r = requests.post(f"{api}/authenticate", timeout=30, data={
+        "client_id": os.environ["RTZR_CLIENT_ID"],
+        "client_secret": os.environ["RTZR_CLIENT_SECRET"]})
+    r.raise_for_status()
+    auth = {"Authorization": "bearer " + r.json()["access_token"]}
+    config = {"use_diarization": True, "diarization": {"spk_count": 0},   # 0 = 화자 수 자동
+              "use_itn": True, "use_disfluency_filter": True}
+    if STT_KEYWORDS:
+        config["keywords"] = STT_KEYWORDS
+    with open(path, "rb") as f:
+        r = requests.post(f"{api}/transcribe", headers=auth, timeout=1800,
+                          files={"file": f}, data={"config": json.dumps(config)})
+    r.raise_for_status()
+    job = r.json()["id"]
+    deadline = time.time() + 3600
+    while time.time() < deadline:
+        time.sleep(5)
+        r = requests.get(f"{api}/transcribe/{job}", headers=auth, timeout=30)
+        if r.status_code == 429:            # 조회가 너무 잦음. 잠시 뒤 다시
+            continue
+        r.raise_for_status()
+        res = r.json()
+        if res["status"] == "completed":
+            return by_speaker((u["spk"] + 1, u["msg"]) for u in res["results"]["utterances"])
+        if res["status"] == "failed":
+            raise RuntimeError(f"RTZR 전사 실패: {res.get('error')}")
+    raise RuntimeError("RTZR 전사가 1시간 안에 끝나지 않았습니다")
+
+
+def transcribe_clova(path):
+    import requests
+    params = {"language": "ko-KR", "completion": "sync", "fullText": True,
+              "diarization": {"enable": True}}
+    if STT_KEYWORDS:
+        params["boostings"] = [{"words": ",".join(STT_KEYWORDS)}]
+    with open(path, "rb") as f:
+        r = requests.post(
+            os.environ["CLOVA_INVOKE_URL"].rstrip("/") + "/recognizer/upload", timeout=3600,
+            headers={"Accept": "application/json;UTF-8",
+                     "X-CLOVASPEECH-API-KEY": os.environ["CLOVA_SECRET"]},
+            files={"media": f, "params": (None, json.dumps(params, ensure_ascii=False).encode(),
+                                          "application/json")})
+    r.raise_for_status()
+    res = r.json()
+    if res.get("result") != "COMPLETED":
+        raise RuntimeError(f"CLOVA 전사 실패: {res.get('message')}")
+    return by_speaker((s.get("speaker", {}).get("label", "?"), s["text"]) for s in res["segments"])
+
+
 def transcribe(wav_path):
     """전사. 완성본은 .txt로 캐시하고, 진행 중에는 .txt.part에 한 줄씩 적는다."""
     from faster_whisper import BatchedInferencePipeline
@@ -251,6 +336,22 @@ def transcribe(wav_path):
     if os.path.exists(txt_path):
         print("  기존 전사본 재사용")
         return open(txt_path, encoding="utf-8").read().strip()
+
+    api = {"rtzr": transcribe_rtzr, "clova": transcribe_clova}.get(STT)
+    if api:
+        print(f"  {STT} API로 전사 (업로드 후 보통 몇 분)")
+        upload = None
+        try:
+            upload = upload_copy(wav_path)
+            out = api(upload)
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(out + "\n")
+            return out
+        except Exception as e:
+            print(f"  {STT} API 실패, 로컬 Whisper로 전사합니다: {e}")
+        finally:
+            if upload and os.path.exists(upload):
+                os.remove(upload)
 
     part_path = txt_path + ".part"
     lines, offset = resume_from(part_path)
@@ -390,8 +491,10 @@ def main():
     work = os.path.join(tempfile.gettempdir(), "회의록")
     os.makedirs(work, exist_ok=True)
     wav_path = os.path.join(work, stamp.strftime("회의록_%Y-%m-%d_%H%M") + ".wav")
-    transcriber = LiveTranscriber(live, wav_path)
-    transcriber.start()
+    # API 전사는 녹음 뒤에 한 번에 올리는 게 빠르므로 로컬일 때만 미리 전사한다.
+    transcriber = LiveTranscriber(live, wav_path) if STT == "local" else None
+    if transcriber:
+        transcriber.start()
 
     print(f"\n● 녹음 중 [{', '.join(t.label for t in live)}]. 회의 끝나면 Enter.")
     try:
@@ -402,9 +505,10 @@ def main():
         t.stopping.set()
     for t in live:
         t.join(timeout=3)
-    transcriber.stopping.set()
-    print("\n  진행 중인 전사 덩어리 마무리…")
-    transcriber.join()
+    if transcriber:
+        transcriber.stopping.set()
+        print("\n  진행 중인 전사 덩어리 마무리…")
+        transcriber.join()
 
     audio = mix(*(t.mono() for t in live))
     secs = len(audio) / SR
@@ -439,6 +543,9 @@ def selftest():
     assert next_start(0.0, 28.0, None) == 25.0            # 말 없으면 3초만 겹쳐 다음으로
     assert next_start(0.0, 28.0, 27.5) == 27.5            # 마지막 문장 끝부터
     assert next_start(30.0, 58.0, 41.0) == 55.0           # 3초 넘게 되돌아가지 않음
+
+    assert by_speaker([(1, "안녕"), (1, "하세요"), (2, "네"), (1, " "), (1, "시작")]) == \
+        "화자1: 안녕 하세요\n화자2: 네\n화자1: 시작"
 
     t = Track(None, "가짜")
     t.frames = [np.arange(i * 4, i * 4 + 4, dtype="float32") for i in range(5)]
