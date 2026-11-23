@@ -402,9 +402,13 @@ def summarize(transcript):
     except subprocess.TimeoutExpired:
         return "(요약 실패: 15분 안에 응답이 없었습니다. 아래 전문을 참고하세요.)"
     out = r.stdout.strip()
-    if "Not logged in" in out + r.stderr or "/login" in out + r.stderr:
-        return ("(요약 실패: Claude Code에 로그인되어 있지 않습니다. 명령 프롬프트에서 claude 를 실행하고 "
-                "/login 으로 Pro 계정에 로그인한 뒤 다시 돌리세요. 아래 전문을 참고하세요.)")
+    msg = (out + " " + r.stderr).lower()
+    if any(k in msg for k in ("not logged in", "/login", "authenticate", "oauth", "expired")):
+        # 로그인 세션은 주기적으로 만료된다. setup-token으로 받은 장기 토큰은 1년 간다.
+        return ("(요약 실패: Claude Code 로그인이 안 되어 있거나 만료되었습니다. 명령 프롬프트에서 "
+                "claude setup-token 을 실행해 나온 토큰을 환경변수 CLAUDE_CODE_OAUTH_TOKEN 에 "
+                "등록하면 다시 만료되지 않습니다(당장은 claude 실행 후 /login 으로도 됩니다). "
+                "아래 전문을 참고하세요.)")
     if r.returncode != 0 or not out:
         # CLI는 사용량 초과 같은 오류를 stdout에 찍기도 하므로 둘 다 본다.
         why = (r.stderr.strip() or out)[:500] or f"빈 응답, 종료 코드 {r.returncode}"
